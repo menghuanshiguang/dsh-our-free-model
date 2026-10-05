@@ -42,6 +42,7 @@ const suites = [
   ['tui', 'tui-test.mjs', []],
   ['catalog', 'catalog-test.mjs', []],
   ['vault', 'vault-test.mjs', []],
+  ['secret', 'secret-test.mjs', []],
   ['offline', 'offline-test.mjs', []],
 ].filter(([name]) => only === null || name.startsWith(only))
 

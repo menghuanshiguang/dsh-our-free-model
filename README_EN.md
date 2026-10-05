@@ -219,19 +219,31 @@ proxy`. Optional and off by default — with it off, requests go direct. Two mod
   minutes and sends traffic to the fastest node, health-checking dead nodes out.
   **The subscription URL is treated as a credential** — the path of a
   subscription link *is* its token — so it lives at the same standard as the two
-  forward keys: kept in the local settings file, never sent with a request, and
-  never echoed in a settings payload. The panel shows the masked host only
-  (`https://host/…`); "Show" and "Copy" fetch the value from the settings page
-  itself (`GET /egress/url`), an empty input means "keep the stored address", and
-  "Clear" removes it and takes the outlet down with it.
+  forward keys: never sent with a request, never echoed in a settings payload,
+  and **never written to disk in the clear** (see "At rest" below). The panel
+  shows the masked host only (`https://host/…`); "Show" and "Copy" fetch the
+  value from the settings page itself (`GET /egress/url`), an empty input means
+  "keep the stored address", and "Clear" removes it and takes the outlet down
+  with it.
 - **Single-proxy mode**: type an `http://` / `https://` / `socks5://` /
-  `socks5h://` proxy address and every handled request dials through it.
+  `socks5h://` proxy address and every handled request dials through it. A
+  password in that address is sealed the same way.
 
-**At rest.** mihomo has to read that address out of a config file (the plugin
-writes a throwaway `mihomo.yaml` into its data directory and spawns mihomo from
-there), so the on-disk copy stays plain text. What this treatment removes is the
-payload echo, the log line and the shoulder — not another process on the same
-machine.
+**At rest.** The address in the settings file is **sealed, not plain text**: the
+`secret` field holds Windows DPAPI ciphertext (current user), or on other
+platforms AES-256-GCM under a key derived by scrypt from a fingerprint of this
+machine. The panel names which one is in force — the second only raises the cost
+of an offline attack and is documented as the weaker half. Copying, syncing or
+pasting `settings.json` therefore leaks no subscription token; carried to another
+machine or Windows account the seal will not open, and the panel asks for the
+address again. A plaintext `url` left by an earlier build is sealed in place on
+first read, and the clear copy leaves the file with it.
+
+The one copy that stays plain text is mihomo's own config: it has to read the
+address out of a file (the plugin writes a throwaway `mihomo.yaml` into its data
+directory and spawns mihomo from there), so **that** copy is readable on the same
+machine's disk. What this treatment removes is the settings file, the payload
+echo, the log line and the shoulder — not another process on the same machine.
 
 Only three kinds of traffic are taken over: model inference, the model listing
 fetch, and the egress IP probe; announcements, upgrades, and the EAC lane stay
