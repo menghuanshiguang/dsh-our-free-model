@@ -169,8 +169,14 @@ export const SETTINGS_INITIAL = {
   /** Route inference/probe traffic through an outlet. `mode: 'subscription'`
    *  spawns a local mihomo that load-balances a Clash subscription; `mode:
    *  'client'` dials one http/https/socks5/socks5h URL directly. Off by
-   *  default — requests go straight out until this is turned on. */
-  egress: { enabled: false, mode: 'subscription', url: '', mihomoPath: '' },
+   *  default — requests go straight out until this is turned on.
+   *
+   *  The address is a bearer credential — the path of a subscription link *is*
+   *  its token — so it is never stored in the clear: `secret` holds a
+   *  machine-bound seal (`src/secret.js`) and `label` is the masked host the
+   *  settings panel renders. A `url` field left by an earlier build is sealed on
+   *  first read and dropped from the file. */
+  egress: { enabled: false, mode: 'subscription', secret: null, label: '', mihomoPath: '' },
   /** Cap a turn's output so a slow lane cannot run away. */
   defaultMaxTokens: 32768,
   /** 所有模型默认允许一次纯推理检查点续写，false 可关闭。 */

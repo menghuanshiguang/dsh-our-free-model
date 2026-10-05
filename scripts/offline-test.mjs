@@ -145,13 +145,18 @@ const dataDir = home => path.join(home, 'our-free-model')
 
 // ── the outlet address is a credential, not a setting ────────────────────────
 // The one secret a user of this plugin does paste in is a subscription link,
-// whose path *is* its token. So it is held to the forward keys' standard: stored
-// as given, absent from every routine payload, and served only when the settings
-// page itself asks for it (`GET /egress/url`).
+// whose path *is* its token. So it is held to the forward keys' standard and
+// then some: absent from every routine payload, served only when the settings
+// page itself asks for it (`GET /egress/url`), and sealed on disk rather than
+// written in the clear. The seeded file below carries the pre-seal shape on
+// purpose, so this block also pins the upgrade path that seals it in place.
 {
   const token = 'ofm-subscription-token-0123456789abcdef'
   const address = `https://outlet.example.com/s/${token}`
   const { ctx, api, home } = await boot({ settings: { egress: { enabled: false, mode: 'subscription', url: address, mihomoPath: '' } } })
+  const settingsFile = path.join(dataDir(home), 'settings.json')
+  const stored = () => JSON.parse(fs.readFileSync(settingsFile, 'utf8'))
+  const raw = () => fs.readFileSync(settingsFile, 'utf8')
 
   const summary = await callRoute(api(), 'GET', '/api/our-free-model/summary')
   const egress = summary.json.settings.egress
@@ -161,14 +166,59 @@ const dataDir = home => path.join(home, 'our-free-model')
 
   const revealed = await callRoute(api(), 'GET', '/api/our-free-model/egress/url')
   check("the value is served on the settings page's own ask", revealed.json.url, address)
+  check('and the ask is the read that seals it', typeof stored().egress.secret?.scheme, 'string')
+  check('— the token is nowhere in it', raw().includes(token), false)
+  check('— and the old plaintext field is gone', stored().egress.url, undefined)
 
   const kept = await callRoute(api(), 'POST', '/api/our-free-model/settings', { egress: { mode: 'client', mihomoPath: '' } })
   check('a patch that carries no URL keeps the stored one', kept.status, 200)
-  check('— in the file', JSON.parse(fs.readFileSync(path.join(dataDir(home), 'settings.json'), 'utf8')).egress.url, address)
+  check('— the sealed record survives a patch that does not name it', typeof stored().egress.secret?.scheme, 'string')
+  check('— still no plaintext in the file', raw().includes(token), false)
   check('— and still not in the answer', 'url' in (kept.json.settings.egress ?? {}), false)
+  const stillThere = await callRoute(api(), 'GET', '/api/our-free-model/egress/url')
+  check('— and the address still unseals to the same value', stillThere.json.url, address)
+
+  const replaced = await callRoute(api(), 'POST', '/api/our-free-model/settings', { egress: { url: 'https://other.example.com/s/second-token-abcdef0123456789' } })
+  check('a pasted address replaces the stored one', [replaced.status, replaced.json.settings.egress.urlLabel], [200, 'https://other.example.com'])
+  check('— and the first token is gone from the file', raw().includes(token), false)
+  check('— and the second is not in the clear either', raw().includes('second-token'), false)
 
   const cleared = await callRoute(api(), 'POST', '/api/our-free-model/settings', { egress: { enabled: false, url: '' } })
   check('clearing it is still possible, and says so in the payload', [cleared.status, cleared.json.settings.egress.hasUrl], [200, false])
+  check('— and the seal is gone with it', stored().egress.secret, null)
+
+  dispose(ctx)
+  fs.rmSync(home, { recursive: true, force: true })
+}
+
+// ── a seal that will not open here is said out loud ──────────────────────────
+// The record below was written for another machine (or another Windows account):
+// every field is well-formed, so only the authentication check can tell. The
+// plugin must report that state instead of calling the address missing, and it
+// must not spawn anything while the address is unreadable.
+{
+  const foreign = {
+    enabled: true,
+    mode: 'client',
+    mihomoPath: '',
+    label: 'https://outlet.example.com',
+    secret: {
+      scheme: 'machine-aes',
+      salt: Buffer.alloc(16, 1).toString('base64'),
+      iv: Buffer.alloc(12, 2).toString('base64'),
+      tag: Buffer.alloc(16, 3).toString('base64'),
+      data: Buffer.alloc(48, 4).toString('base64'),
+    },
+  }
+  const { ctx, api, home } = await boot({ settings: { egress: foreign } })
+
+  const summary = await callRoute(api(), 'GET', '/api/our-free-model/summary')
+  const egress = summary.json.settings.egress
+  check('the panel is told the address is on file but sealed shut', [egress.hasUrl, egress.secretUnreadable], [true, true])
+  check('and the masked host still renders, so the user knows which one', egress.urlLabel, 'https://outlet.example.com')
+  check('the address is not invented in its place', (await callRoute(api(), 'GET', '/api/our-free-model/egress/url')).json.url, '')
+  check('the outlet reports why it is not running', String(egress.error).includes('cannot be decrypted'), true)
+  check('and nothing was spawned for it', egress.running, false)
 
   dispose(ctx)
   fs.rmSync(home, { recursive: true, force: true })

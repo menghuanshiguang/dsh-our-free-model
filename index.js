@@ -34,6 +34,7 @@ import { STATE, detectEgress, probeCatalog } from './src/probe.js'
 import { generateKey, startForwardServer, startLanRelay, toOpenAiUsage } from './src/forward.js'
 import { CODE, UpstreamError, getJson } from './src/http.js'
 import { outletLabel, readOutletSelection, startEgressRelay } from './src/egress.js'
+import { openSecret, sealSecret, secretBackend } from './src/secret.js'
 import { fetchSealedListing } from './src/eac.js'
 import { unlockSealedLane } from './src/vault.js'
 import { mintRequestId, sessionForConversation } from './src/upstream.js'
@@ -163,6 +164,8 @@ export function apply(ctx, config) {
    *  default. Named `outlet*` so the `egress` IP/country snapshot stays clear. */
   let outletRelay = null
   let outletError = ''
+  /** The stored address exists but its seal would not open on this host. */
+  let outletUnreadable = false
   /** Last reading of the outlet's own view of itself, cached for `/summary`. */
   let outletNode = { node: '', delayMs: 0, at: 0 }
   /** How long the last successful listing round took over the current path. */
@@ -745,6 +748,100 @@ export function apply(ctx, config) {
       latencyAt: gatewayLatency.at,
     }
   }
+  /**
+   * The stored shape of the outlet settings — the one place it is defined.
+   *
+   * Deliberately a whitelist rather than a spread: the address is a bearer
+   * credential, and a record that carried a plaintext `url` through a spread
+   * would put it back in the file it was just sealed out of.
+   */
+  function egressRecordOf(record = {}) {
+    return {
+      enabled: record.enabled === true,
+      mode: record.mode === 'client' ? 'client' : 'subscription',
+      mihomoPath: String(record.mihomoPath ?? ''),
+      secret: record.secret ?? null,
+      label: String(record.label ?? ''),
+    }
+  }
+
+  /** Replace the stored outlet record, never carrying a plaintext address. */
+  function writeEgressRecord(record) {
+    settings.edit(state => ({ ...state, egress: egressRecordOf(record) }))
+    settings.flush()
+  }
+
+  /**
+   * The outlet address, unsealed for one use, plus the normalised record.
+   *
+   * A subscription link's path *is* its token and a proxy URL carries its
+   * password, so neither is written to `settings.json` in the clear: `secret`
+   * holds a machine-bound seal (`src/secret.js`) and `label` is the masked host
+   * the panel renders. A record written before this seal existed still carries a
+   * plaintext `url`; the first read seals it in place and drops the clear copy,
+   * so an upgrade does not leave the old copy behind for the life of the file.
+   *
+   * `unreadable` is the honest answer when the seal will not open — a settings
+   * file carried to another computer or Windows account. The caller says that
+   * out loud rather than reporting a missing address, which would read as a
+   * mistake the user did not make.
+   */
+  async function egressAddressOf(record = {}) {
+    const sealed = record?.secret
+    if (sealed === null || sealed === undefined) {
+      const legacy = String(record?.url ?? '').trim()
+      if (legacy === '') return { url: '', label: '', unreadable: false, record: egressRecordOf(record) }
+      const secret = await sealSecret(legacy)
+      const migrated = egressRecordOf({ ...record, secret, label: outletLabel(legacy) })
+      writeEgressRecord(migrated)
+      return { url: legacy, label: migrated.label, unreadable: false, record: migrated }
+    }
+    const url = await openSecret(sealed)
+    if (url === undefined) {
+      return { url: '', label: String(record?.label ?? ''), unreadable: true, record: egressRecordOf(record) }
+    }
+    return {
+      url,
+      label: String(record?.label ?? '') || outletLabel(url),
+      unreadable: false,
+      record: egressRecordOf({ ...record, label: String(record?.label ?? '') || outletLabel(url) }),
+    }
+  }
+
+  /**
+   * Fold one settings patch into the stored outlet record.
+   *
+   * The address never travels as itself: a pasted value is sealed before it is
+   * stored and only its masked host is kept beside it, an empty value clears the
+   * stored credential, and an absent value leaves whatever is on file untouched
+   * — the page is never handed the stored address, so it cannot echo it back.
+   *
+   * @param {object} base - the normalised record from `egressAddressOf`
+   * @param {object} patch - the `url`/`enabled`/`mode`/`mihomoPath` fields the route accepted
+   */
+  async function egressPatchOf(base, patch) {
+    let secret = base?.secret ?? null
+    let label = String(base?.label ?? '')
+    if (patch.url !== undefined) {
+      const value = String(patch.url).trim()
+      if (value === '') {
+        secret = null
+        label = ''
+      } else {
+        secret = await sealSecret(value)
+        label = outletLabel(value)
+      }
+    }
+    return egressRecordOf({
+      ...base,
+      enabled: patch.enabled === undefined ? base?.enabled === true : patch.enabled === true,
+      mode: patch.mode === undefined ? base?.mode : patch.mode,
+      mihomoPath: patch.mihomoPath === undefined ? base?.mihomoPath : patch.mihomoPath,
+      secret,
+      label,
+    })
+  }
+
   // Same serialisation gate as the two listeners above: the boot chain and every
   // settings POST call this, and overlapping runs would leak a spawned mihomo
   // (the loser overwrites `outletRelay` while the winner's child still runs).
@@ -761,7 +858,11 @@ export function apply(ctx, config) {
     const desired = settings.get().egress ?? {}
     const wanted = desired.enabled === true
     const mode = desired.mode === 'client' ? 'client' : 'subscription'
-    const url = String(desired.url ?? '').trim()
+    // One unseal per sync, before the fingerprint is compared: the relay's own
+    // `config()` is synchronous, so the address has to be in hand by then.
+    const address = await egressAddressOf(desired)
+    const url = address.url
+    outletUnreadable = address.unreadable
     const mihomoPath = String(desired.mihomoPath ?? '').trim()
     const fingerprint = `${mode}\n${url}\n${mihomoPath}`
     if (outletRelay !== null && wanted && outletFingerprint === fingerprint && !outletRelay.dead) return
@@ -779,6 +880,11 @@ export function apply(ctx, config) {
       outletError = ''
       return
     }
+    if (address.unreadable) {
+      outletError = 'the stored outlet address cannot be decrypted on this machine (a different computer or Windows account?) — paste it again'
+      logger.warn?.(`our-free-model: egress outlet not started (${outletError})`)
+      return
+    }
     if (url === '') {
       outletError = 'the outlet needs a subscription or proxy URL'
       logger.warn?.(`our-free-model: egress outlet not started (${outletError})`)
@@ -786,11 +892,13 @@ export function apply(ctx, config) {
     }
     try {
       outletRelay = await startEgressRelay({
+        // The address is already unsealed above; this closure only has to answer
+        // synchronously, so it re-reads the two fields that are not secret.
         config: () => {
           const current = settings.get().egress ?? {}
           return {
             mode: current.mode === 'client' ? 'client' : 'subscription',
-            url: String(current.url ?? '').trim(),
+            url,
             mihomoPath: String(current.mihomoPath ?? '').trim(),
           }
         },
@@ -967,6 +1075,8 @@ export function apply(ctx, config) {
   const api = createApiRoutes({
     settings, stats, availability, catalog: () => catalog, state,
     refreshCatalog, refreshAvailability, syncForward, syncRelay, syncEgress,
+    egressAddress: () => egressAddressOf(settings.get().egress ?? {}),
+    egressPatch: egressPatchOf,
     forwardInfo: () => ({
       running: forward !== null,
       port: forward?.port ?? 0,
@@ -999,6 +1109,11 @@ export function apply(ctx, config) {
       // `dead` is the managed mihomo dying after startup — surfaced through the
       // same field so the settings page shows why traffic fell back to direct.
       error: outletError !== '' ? outletError : (outletRelay?.dead ?? ''),
+      // The stored address is sealed rather than written in the clear, so the
+      // page is told which backend holds it and when that seal will not open.
+      secretScheme: settings.get().egress?.secret?.scheme ?? '',
+      secretUnreadable: outletUnreadable,
+      backend: secretBackend(),
     }),
     // The settings page polls this while the outlet is on: which node url-test is
     // carrying traffic on is mihomo's own state, and it changes without anything
@@ -1663,8 +1778,12 @@ function createApiRoutes(deps) {
               egressPatch[key] = value
             }
           }
-          const egress = { ...(current.egress ?? {}), ...egressPatch }
-          if (egress.enabled === true && String(egress.url ?? '') === '') {
+          // The base is the normalised record, not the raw one: a plaintext `url`
+          // left by an earlier build is sealed by this read, so a patch that only
+          // changes `mode` cannot drop the address on the way past.
+          const currentAddress = await deps.egressAddress()
+          const egress = await deps.egressPatch(currentAddress.record, egressPatch)
+          if (egress.enabled === true && egress.secret === null) {
             return send(400, { error: 'the outlet needs a subscription or proxy URL' })
           }
           next.egress = egress
@@ -1698,9 +1817,11 @@ function createApiRoutes(deps) {
       }
       // The subscription/proxy URL is a credential, so it lives outside every
       // routine payload and leaves the process only when the settings page asks
-      // for it — the same shape as the forward keys above.
+      // for it — the same shape as the forward keys above. It is unsealed for
+      // exactly this answer; `unreadable` says the seal would not open here.
       if (method === 'GET' && routePath === '/egress/url') {
-        return send(200, { url: deps.settings.get().egress?.url ?? '' })
+        const address = await deps.egressAddress()
+        return send(200, { url: address.url, unreadable: address.unreadable })
       }
       if (method === 'POST' && routePath === '/bench') {
         const body = await readJson(req)
@@ -1780,15 +1901,22 @@ function publicSettings(settings, forwardInfo, egressInfo) {
       },
     },
     // A subscription link is not an endpoint, it is a bearer credential: the
-    // path of the URL *is* the token, which is why it is handled like the
-    // forward keys and not like `feedUrl`. Stored as given, but never echoed —
-    // `urlLabel` is the masked host for the panel, `hasUrl` says whether one is
-    // set at all, and the value itself is served only by `GET /egress/url`, on
-    // the settings page's own ask (see src/egress.js `outletLabel`).
+    // path of the URL *is* its token, which is why it is handled like the
+    // forward keys and not like `feedUrl`. It is also not stored as given — the
+    // file holds a machine-bound seal (`secret`, see src/secret.js) and only the
+    // masked host is kept beside it, so the panel renders `urlLabel` without
+    // ever unsealing anything. The value itself is served only by
+    // `GET /egress/url`, on the settings page's own ask.
     egress: {
       ...pick(settings.egress ?? {}, ['enabled', 'mode', 'mihomoPath']),
-      hasUrl: String(settings.egress?.url ?? '') !== '',
-      urlLabel: outletLabel(settings.egress?.url ?? ''),
+      hasUrl: (settings.egress?.secret ?? null) !== null || String(settings.egress?.url ?? '') !== '',
+      urlLabel: String(settings.egress?.label ?? '') || outletLabel(settings.egress?.url ?? ''),
+      // Which backend holds the seal, and the honest answer when it will not
+      // open here — the page can then ask for the address again instead of
+      // reporting an outlet that simply refuses to start.
+      secretScheme: egressInfo?.secretScheme ?? '',
+      secretUnreadable: egressInfo?.secretUnreadable === true,
+      backend: egressInfo?.backend ?? '',
       outlet: egressInfo?.outlet ?? '',
       running: egressInfo?.running === true,
       active: egressInfo?.active === true,
