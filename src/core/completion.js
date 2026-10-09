@@ -1,5 +1,6 @@
 import { ROUTE_MAIN, ROUTE_REGION } from '../adapter.js'
 import { toOpenAiUsage } from '../forward.js'
+import { defaultEffortFor, effortsFor } from '../effort.js'
 
 export function routableModelIds(snapshot) {
   const membership = new Set(snapshot.membership[ROUTE_MAIN] ?? [])
@@ -11,13 +12,27 @@ export function routableModelIds(snapshot) {
 
 export function publicModelRows(snapshot) {
   const membership = routableModelIds(snapshot)
+  const fallback = snapshot.settings.defaultMaxTokens
   return snapshot.catalog
     .filter(entry => membership.has(entry.id))
-    .map(entry => ({
-      id: entry.id, object: 'model',
-      created: Math.floor(Date.now() / 1000), owned_by: 'our-free-model',
-      ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
-    }))
+    .map(entry => {
+      // The thinking strengths this model takes, advertised on the roster the
+      // forward port serves. A caller had no way to learn them — the ladder is
+      // the plugin's own ids, and guessing at them (or at OpenAI's adjectives,
+      // which now resolve onto the same rungs) was the whole of what the API
+      // said about effort. `effortsFor` is the same call the picker's menu is
+      // built from, so the roster and the menu cannot disagree.
+      const efforts = effortsFor(entry, undefined, fallback)
+      return {
+        id: entry.id, object: 'model',
+        created: Math.floor(Date.now() / 1000), owned_by: 'our-free-model',
+        ...entry.contextWindow === undefined ? {} : { context_window: entry.contextWindow },
+        ...efforts === undefined ? {} : {
+          x_ofm_efforts: efforts.map(row => row.id),
+          x_ofm_effort_default: defaultEffortFor(entry),
+        },
+      }
+    })
 }
 
 /** 固定本次请求的模型和配置快照，两个入口使用同一条推理链路。 */
