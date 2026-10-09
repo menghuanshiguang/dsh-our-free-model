@@ -50,6 +50,7 @@ export function createModelRuntime({
   sealedCredential = () => null,
   onSealedUnavailable = () => {},
   onTopology = () => {},
+  onQuotaHit = () => {},
 }) {
   let catalog = materializeCatalog(catalogStore.get().entries ?? [])
   let sealedCatalog = sealedCredential() === null ? [] : buildEacCatalog(catalogStore.get().sealIds ?? [])
@@ -93,6 +94,10 @@ export function createModelRuntime({
       }, 4000)
       reprobeTimer.unref?.()
     },
+    // A quota refusal is an exit verdict, and only the host half holds the
+    // outlet. The answer travels back up: `true` means the exit really moved,
+    // which is what licenses the adapter to re-send the refused turn.
+    onQuotaHit: entry => (disposed ? false : onQuotaHit(entry)),
   })
 
   // 手动强制刷新不能借用一个因限流而跳过探测的普通刷新。
