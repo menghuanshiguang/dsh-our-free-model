@@ -85,6 +85,9 @@ const INDIRECT = new Set([
   'state.available', 'state.region-blocked', 'state.throttled', 'state.unavailable', 'state.unknown',
   'ann.preamble', 'ann.models', 'ann.steps', 'ann.features', 'ann.updates',
   'level.info', 'level.update', 'level.warn', 'level.urgent',
+  // `unitLabel()` picks one of these from the unit a channel bills in, so the
+  // literal reaches `t()` only at the call site, never in this file's own text.
+  'chan.credits.left', 'chan.credits.usd', 'chan.credits.tokens', 'chan.credits.quota',
 ])
 
 for (const language of ['zh', 'en']) {
